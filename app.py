@@ -336,3 +336,20 @@ def pacing(
         "items": items_out,
         "debug": debug_summary,
     }
+
+from fastapi.openapi.utils import get_openapi
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    schema["servers"] = [{"url": "https://phd-ai-meta-pacing.onrender.com"}]  # <-- your Render URL
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi
