@@ -20,7 +20,7 @@ EXPECTED_API_KEY = os.getenv("API_KEY", "")  # optional protection
 app = FastAPI(
     title="Meta Ads Pacing API",
     description="Fetches Meta budgets+spend, computes daily/flight pacing at ad set or campaign level, optional 7-day series and filters.",
-    version="1.7.0",
+    version="1.8.0",
 )
 
 # ---------- helpers ----------
@@ -206,6 +206,7 @@ def pacing(
     campaign_filter: Optional[str] = None,   # substring on campaign name
     campaign_ids: Optional[str] = None,      # comma-separated campaign IDs (exact match)
     name_filter: Optional[str] = None,       # substring on ad set or campaign name
+    include_campaign_overlay: bool = False,    # add campaign series on adset charts
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     x_api_key_query: Optional[str] = Query(default=None, alias="x_api_key"),
 ):
@@ -222,6 +223,11 @@ def pacing(
         raise HTTPException(status_code=400, detail="Supports level=adset or level=campaign.")
 
     tz_name = tz or DEFAULT_TZ
+
+    # Caches to avoid redundant campaign-level calls when overlaying campaign data on adset rows
+    campaign_today_cache: Dict[str, float] = {}
+    campaign_cum_cache: Dict[str, float] = {}
+    campaign_series_cache: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}  # (cid, since, until) -> series rows
 
     # Preprocess campaign_ids into a set for quick matching
     campaign_id_set: Optional[Set[str]] = None
@@ -343,15 +349,38 @@ def pacing(
             }
 
             # Optional: 7-day series (today inclusive)
+            tzobj = account_tz(tz_name)
+            today_local = now.astimezone(tzobj).date()
+            since_7 = (today_local - timedelta(days=6)).isoformat()  # 6 days ago + today = 7 rows
+            until_7 = today_local.isoformat()
+
             if include_series_7d:
-                tzobj = account_tz(tz_name)
-                today_local = now.astimezone(tzobj).date()
-                since_7 = (today_local - timedelta(days=6)).isoformat()  # 6 days ago + today = 7 rows
-                until_7 = today_local.isoformat()
                 series_rows = get_insights_series(adset_id, since_7, until_7)
                 series = [{"date": r.get("date_start"), "spend": to_float(r.get("spend", 0.0))}
                           for r in series_rows if r.get("date_start")]
                 item["spend_series_7d"] = series
+
+            # NEW: Optional campaign overlay for charts (adds a second line)
+            if include_campaign_overlay and campaign_id:
+                # today
+                if campaign_id not in campaign_today_cache:
+                    ins_c_today = get_insights_single(campaign_id, date_preset="today")
+                    campaign_today_cache[campaign_id] = to_float(ins_c_today.get("spend", 0.0))
+                item["campaign_spend_today"] = campaign_today_cache[campaign_id]
+
+                # to-date
+                if campaign_id not in campaign_cum_cache:
+                    ins_c_cum = get_insights_single(campaign_id, **{"time_range[since]": since, "time_range[until]": until})
+                    campaign_cum_cache[campaign_id] = to_float(ins_c_cum.get("spend", 0.0))
+                item["campaign_spend_to_date"] = campaign_cum_cache[campaign_id]
+
+                # 7d series overlay (uses same local date window)
+                key7 = (campaign_id, since_7, until_7)
+                if key7 not in campaign_series_cache:
+                    c_series_rows = get_insights_series(campaign_id, since_7, until_7)
+                    campaign_series_cache[key7] = [{"date": r.get("date_start"), "spend": to_float(r.get("spend", 0.0))}
+                                                   for r in c_series_rows if r.get("date_start")]
+                item["campaign_spend_series_7d"] = campaign_series_cache[key7]
 
             items_out.append(item)
 
@@ -492,7 +521,8 @@ def pacing(
             "name_filter": name_filter,
             "include_series_7d": include_series_7d,
             "sort_by": sort_by,
-            "overspend_first": overspend_first
+            "overspend_first": overspend_first,
+            "include_campaign_overlay": include_campaign_overlay
         }
     }
 
